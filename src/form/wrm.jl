@@ -2,7 +2,6 @@
 import LinearAlgebra: Hermitian, cholesky, Symmetric, diag, I
 import SparseArrays: SparseMatrixCSC, sparse, spdiagm, findnz, spzeros, nonzeros
 
-
 ""
 function constraint_current_limit_from(pm::AbstractWRMModel, n::Int, f_idx, c_rating_a)
     l,i,j = f_idx
@@ -317,7 +316,7 @@ end
 
 
 """
-    cadj, lookup_index, ordering = _chordal_extension(pm, nw)
+    cadj, lookup_index, ordering = _chordal_extension(pm, nw, clique_merge=false)
 Return:
 - a sparse adjacency matrix corresponding to a chordal extension
 of the power grid graph.
@@ -325,13 +324,11 @@ of the power grid graph.
 of the bus with `bus_id` in the adjacency matrix.
 - the graph ordering that may be used to reconstruct the chordal extension
 """
-function _chordal_extension(pm::AbstractPowerModel, nw::Int)
+function _chordal_extension(pm::AbstractPowerModel, nw::Int, clique_merge::Bool=false)
     adj, lookup_index = _adjacency_matrix(pm, nw)
     nb = size(adj, 1)
-    diag_el = sum(adj, dims=1)[:]
-    W = Hermitian(-adj + spdiagm(0 => diag_el .+ 1))
 
-    F = cholesky(W)
+    F = _fact_cholesky(adj, pm)
     L = sparse(F.L)
     p = F.p
     q = invperm(p)
@@ -340,9 +337,208 @@ function _chordal_extension(pm::AbstractPowerModel, nw::Int)
     f_idx, t_idx, V = findnz(Rchol)
     cadj = sparse([f_idx;t_idx], [t_idx;f_idx], ones(2*length(f_idx)), nb, nb)
     cadj = cadj[q, q] # revert to original bus ordering (invert cholfact permutation)
+    if clique_merge
+        _merge_cliques_ajd!(cadj)
+        println("Clique merging completed")
+    end
     return cadj, lookup_index, p
 end
 
+
+function _fact_cholesky(adj::SparseMatrixCSC{Float64, Int64}, ::Chordal_AMD)
+    W = _adj_matrix_to_SDP(adj)
+    return cholesky(W)
+end
+
+function _fact_cholesky(adj::SparseMatrixCSC{Float64, Int64}, ::Chordal_MFI)
+    W = _adj_matrix_to_SDP(adj)
+    perm = _minimum_fill_in_permutation(adj)
+    return cholesky(W, perm=perm)
+end
+
+function _fact_cholesky(adj::SparseMatrixCSC{Float64, Int64}, ::Chordal_MD)
+    W = _adj_matrix_to_SDP(adj)
+    perm = _min_degree_permutation(adj)
+    return cholesky(W, perm=perm)
+end
+
+function _fact_cholesky(adj::SparseMatrixCSC{Float64, Int64}, ::Chordal_MCS_M)
+    W = _adj_matrix_to_SDP(adj)
+    perm = _mcs(adj)
+    return cholesky(W, perm=perm)
+end
+
+function _fact_cholesky(adj::SparseMatrixCSC{Float64, Int64}, ::AbstractPowerModel)
+    W = _adj_matrix_to_SDP(adj)
+    return cholesky(W)
+end
+
+function _adj_matrix_to_SDP(adj::SparseMatrixCSC{Float64, Int64})
+    diag_el = sum(adj, dims=1)[:]
+    return Hermitian(-adj + spdiagm(0 => diag_el .+ 1))
+end
+
+function _min_degree_permutation(adj::SparseMatrixCSC{Float64, Int64})
+    nb = size(adj, 1)
+    perm = Vector{Int}(undef, nb)
+    degrees = Dict{Int, Int}()
+
+    G = copy(adj)
+
+    for node in 1:nb
+        degrees[node] = length(findnz(G[:, node])[1])
+    end
+
+    for i in 1:nb
+        # Find the node with the minimum degree
+        min_degree_node = findmin(degrees)[2]
+
+        # Add the node to the permutation
+        perm[i] = min_degree_node
+
+        # Get neighbors of the min degree node
+        neighbors = Set(findnz(G[:, min_degree_node])[1])
+
+        # Remove the node from the graph
+        delete!(degrees, min_degree_node)
+
+        # Update the adjacency matrix and degrees
+        missing_edges = _missing_edges_for_clique(G, min_degree_node)
+        for (ni, nj) in missing_edges
+            G[ni, nj] = 1.0
+            G[nj, ni] = 1.0
+        end
+
+        G[min_degree_node, :] .= 0
+        G[:, min_degree_node] .= 0
+        SparseArrays.dropzeros!(G)
+
+        # Update the degrees of the neighbors
+        for node in neighbors
+            degrees[node] = length(findnz(adj[:, node])[1])
+        end
+    end
+    println("MD computed")
+
+    return perm
+end
+
+function _minimum_fill_in_permutation(adj::SparseMatrixCSC{Float64, Int64})
+    nb = size(adj, 1)
+    perm = Vector{Int}(undef, nb)
+    Gk = copy(adj)
+    
+    # Initialize fill-in values
+    number_of_missing_edges_per_node = Dict{Int, Int}()
+    missing_edges_per_node = Dict{Int, Vector{Tuple{Int, Int}}}()
+    
+    for node in 1:nb
+        missing_edges = _missing_edges_for_clique(Gk, node)
+        missing_edges_per_node[node] = missing_edges
+        number_of_missing_edges_per_node[node] = length(missing_edges)
+    end
+    
+    for k in 1:nb
+        # Find the node with the minimum fill-in
+        vertex_min_missing_edges = findmin(number_of_missing_edges_per_node)[2]
+
+        # Add the node to the permutation
+        perm[k] = vertex_min_missing_edges
+
+        # Get the missing edges for the node
+        missing_edges = missing_edges_per_node[vertex_min_missing_edges]
+
+        # Get neighbors and neighbors of neighbors
+        if isempty(missing_edges)
+            nodes_affected = Set(findnz(Gk[:, vertex_min_missing_edges])[1])
+        else
+            nodes_affected = Set(findnz(Gk[:, vertex_min_missing_edges])[1])
+            for node in nodes_affected
+                nodes_affected = union(nodes_affected, Set(findnz(Gk[:, node])[1]))
+            end
+            delete!(nodes_affected, vertex_min_missing_edges)
+            for (ni, nj) in missing_edges
+                Gk[ni, nj] = 1.0
+                Gk[nj, ni] = 1.0
+            end
+        end
+
+        # Remove the node from the graph
+        delete!(number_of_missing_edges_per_node, vertex_min_missing_edges)
+        delete!(missing_edges_per_node, vertex_min_missing_edges)
+        Gk[vertex_min_missing_edges, :] .= 0
+        Gk[:, vertex_min_missing_edges] .= 0
+        SparseArrays.dropzeros!(Gk)
+
+        # Update the degrees of the neighbors and their neighbors
+        for node in nodes_affected
+            missing_edges = _missing_edges_for_clique(Gk, node)
+            missing_edges_per_node[node] = missing_edges
+            number_of_missing_edges_per_node[node] = length(missing_edges)
+        end
+    end
+    println("MFI computed")
+    return perm
+end
+
+function _missing_edges_for_clique(adj::SparseMatrixCSC{Float64, Int64}, node::Int)
+    neighbors = findnz(adj[:, node])[1]
+    missing_edges = []
+    for i in eachindex(neighbors)
+        for j in (i+1):length(neighbors)
+            ni = neighbors[i]
+            nj = neighbors[j]
+            if adj[ni, nj] == 0
+                push!(missing_edges, (ni, nj))
+            end
+        end
+    end
+    return missing_edges
+end
+
+function _merge_cliques_ajd!(cadj::SparseMatrixCSC{Float64, Int64})
+    groups = _maximal_cliques(cadj)
+    weighted_clique_graph = _weighted_clique_graph(groups)
+    while any(>(0), weighted_clique_graph)
+        index = findfirst(>(0), weighted_clique_graph)
+        i, j = Tuple(index)
+        if j < i
+            i, j = j, i
+        end
+        clique_union = union(groups[i], groups[j])
+        groups[i] = clique_union
+        splice!(groups, j)
+        weighted_clique_graph = _merge_clique_graph(weighted_clique_graph, i, j, groups)
+        for i in clique_union
+            for j in clique_union
+                if i != j
+                    cadj[i, j] = 1.0
+                end
+            end
+        end
+    end
+    return cadj
+end
+
+function _merge_clique_graph(G::SparseMatrixCSC{Int, Int}, i::Int, j::Int, groups::Vector{Vector{Int}})
+    neighbors_j = findnz(G[:, j])[1]
+    for node in neighbors_j
+        if node != i
+            G[i, node] = 1
+            G[node, i] = 1
+        end
+    end
+    merged_G = G[1:end .!= j, 1:end .!= j]
+    neighbors_i = findnz(merged_G[:, i])[1]
+    for node in neighbors_i
+        if node != i
+            weight = length(groups[i])^3 + length(groups[node])^3 - length(union(groups[i], groups[node]))^3
+            merged_G[i, node] = weight
+            merged_G[node, i] = weight
+        end
+    end
+    return merged_G
+end
 
 """
     mc = _maximal_cliques(cadj, peo)
@@ -493,4 +689,24 @@ function _problem_size(groups)
     nvars(n::Integer) = n*(2*n + 1)
     A = _prim(_overlap_graph(groups))
     return sum(nvars.(Int.(nonzeros(A)))) + sum(nvars.(length.(groups)))
+end
+
+function _weighted_clique_graph(groups)
+    n = length(groups)
+    I = Vector{Int}()
+    J = Vector{Int}()
+    V = Vector{Int}()
+    for (i, gi) in enumerate(groups)
+        for (j, gj) in enumerate(groups)
+            if gi != gj
+                if length(intersect(gi, gj)) > 0
+                    weight = length(gi)^3 + length(gj)^3 - length(union(gi, gj))^3
+                    push!(I, i)
+                    push!(J, j)
+                    push!(V, weight)
+                end
+            end
+        end
+    end
+    return sparse(I, J, V, n, n)
 end

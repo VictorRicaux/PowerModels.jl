@@ -515,6 +515,14 @@ Original application to OPF by:
 """
 mutable struct SparseSDPWRMPowerModel <: AbstractSparseSDPWRMModel @pm_fields end
 
+"""
+
+"""
+
+mutable struct Chordal_AMD <: AbstractSparseSDPWRMModel @pm_fields end
+mutable struct Chordal_MD <: AbstractSparseSDPWRMModel @pm_fields end
+mutable struct Chordal_MFI <: AbstractSparseSDPWRMModel @pm_fields end
+mutable struct Chordal_MCS_M <: AbstractSparseSDPWRMModel @pm_fields end
 
 
 ##### Union Types #####
